@@ -45,6 +45,23 @@ MODULE_DESCRIPTION("Microsoft Hyper-V root partition VMM interface /dev/mshv");
 #elif defined(CONFIG_ARM64)
 #define HV_VP_COUNTER_ROOT_DISPATCH_THREAD_BLOCKED 95
 #endif
+	VpStatsMaxCounter
+};
+
+struct hv_stats_page {
+	union {
+		u64 vp_cntrs[VpStatsMaxCounter];		/* VP counters */
+		u8 data[HV_HYP_PAGE_SIZE];
+	};
+} __packed;
+
+bool hv_nofull_mmio;   /* don't map entire mmio region upon fault */
+static int __init setup_hv_full_mmio(char *str)
+{
+	hv_nofull_mmio = true;
+	return 0;
+}
+__setup("hv_nofull_mmio", setup_hv_full_mmio);
 
 struct mshv_root mshv_root;
 
@@ -625,6 +642,7 @@ mshv_partition_region_by_gfn(struct mshv_partition *partition, u64 gfn)
 	return NULL;
 }
 
+#ifdef CONFIG_X86_64
 static struct mshv_mem_region *
 mshv_partition_region_by_gfn_get(struct mshv_partition *p, u64 gfn)
 {
@@ -684,10 +702,15 @@ static bool mshv_handle_gpa_intercept(struct mshv_vp *vp)
 
 	return ret;
 }
+#else  /* CONFIG_X86_64 */
+static bool mshv_handle_gpa_intercept(struct mshv_vp *vp) { return false; }
+#endif /* CONFIG_X86_64 */
 
 static bool mshv_vp_handle_intercept(struct mshv_vp *vp)
 {
 	switch (vp->vp_intercept_msg_page->header.message_type) {
+	case HVMSG_UNMAPPED_GPA:
+		return mshv_handle_unmapped_gpa(vp);
 	case HVMSG_GPA_INTERCEPT:
 		return mshv_handle_gpa_intercept(vp);
 	}
