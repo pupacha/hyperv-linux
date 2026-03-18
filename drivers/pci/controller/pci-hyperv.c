@@ -575,11 +575,11 @@ struct hv_pci_compl {
 
 static void hv_pci_onchannelcallback(void *context);
 
+static bool hv_vmbus_pci_device(struct pci_bus *pbus);
+
 #ifdef CONFIG_X86
 #define DELIVERY_MODE		APIC_DELIVERY_MODE_FIXED
 #define HV_MSI_CHIP_FLAGS	MSI_CHIP_FLAG_SET_ACK
-
-static bool hv_vmbus_pci_device(struct pci_bus *pbus);
 
 static int hv_pci_irqchip_init(void)
 {
@@ -599,26 +599,6 @@ static unsigned int hv_msi_get_int_vector(struct irq_data *data)
 }
 
 #define hv_msi_prepare		pci_msi_prepare
-
-u64 hv_pci_vmbus_device_id(struct pci_dev *pdev)
-{
-	u64 u64val;
-	struct hv_pcibus_device *hbus;
-	struct pci_bus *pbus = pdev->bus;
-
-	if (!hv_vmbus_pci_device(pbus))
-		return 0;
-
-	hbus = container_of(pbus->sysdata, struct hv_pcibus_device, sysdata);
-	u64val = (hbus->hdev->dev_instance.b[5] << 24) |
-		 (hbus->hdev->dev_instance.b[4] << 16) |
-		 (hbus->hdev->dev_instance.b[7] << 8) |
-		 (hbus->hdev->dev_instance.b[6] & 0xf8) |
-		 PCI_FUNC(pdev->devfn);
-
-	return u64val;
-}
-EXPORT_SYMBOL_GPL(hv_pci_vmbus_device_id);
 
 /**
  * hv_irq_retarget_interrupt() - "Unmask" the IRQ by setting its current
@@ -779,6 +759,9 @@ static struct irq_chip hv_arm64_msi_irq_chip = {
 	.irq_mask = irq_chip_mask_parent,
 	.irq_unmask = irq_chip_unmask_parent
 };
+
+static int hv_unmap_interrupt(union hv_device_id hv_devid,
+			      struct hv_interrupt_entry *hvirqe);
 
 static unsigned int hv_msi_get_int_vector(struct irq_data *irqd)
 {
@@ -1029,6 +1012,26 @@ static struct irq_domain *hv_pci_get_root_domain(void)
  */
 static void hv_arch_irq_unmask(struct irq_data *data) { }
 #endif /* CONFIG_ARM64 */
+
+u64 hv_pci_vmbus_device_id(struct pci_dev *pdev)
+{
+	u64 u64val;
+	struct hv_pcibus_device *hbus;
+	struct pci_bus *pbus = pdev->bus;
+
+	if (!hv_vmbus_pci_device(pbus))
+		return 0;
+
+	hbus = container_of(pbus->sysdata, struct hv_pcibus_device, sysdata);
+	u64val = (hbus->hdev->dev_instance.b[5] << 24) |
+		 (hbus->hdev->dev_instance.b[4] << 16) |
+		 (hbus->hdev->dev_instance.b[7] << 8) |
+		 (hbus->hdev->dev_instance.b[6] & 0xf8) |
+		 PCI_FUNC(pdev->devfn);
+
+	return u64val;
+}
+EXPORT_SYMBOL_GPL(hv_pci_vmbus_device_id);
 
 /**
  * hv_pci_generic_compl() - Invoked for a completion packet
@@ -1437,12 +1440,10 @@ static struct pci_ops hv_pcifront_ops = {
 	.write = hv_pcifront_write_config,
 };
 
-#ifdef CONFIG_X86
 static bool hv_vmbus_pci_device(struct pci_bus *pbus)
 {
 	return pbus->ops == &hv_pcifront_ops;
 }
-#endif /* CONFIG_X86 */
 
 /*
  * Paravirtual backchannel
@@ -2158,6 +2159,284 @@ return_null_message:
 	msg->data = 0;
 }
 
+/* Build device id for the interrupt path */
+static u64 hv_build_irq_devid(struct pci_dev *pdev)
+{
+	enum hv_device_type dev_type;
+
+	if (hv_pcidev_is_attached_dev(pdev) || hv_l1vh_partition())
+		dev_type = HV_DEVICE_TYPE_LOGICAL;
+	else
+		dev_type = HV_DEVICE_TYPE_PCI;
+
+	return hv_build_devid_oftype(pdev, dev_type);
+}
+
+
+int hv_unmap_msi_interrupt(struct pci_dev *pdev,
+			   struct hv_interrupt_entry *hvirqe)
+{
+	union hv_device_id hv_devid;
+
+	hv_devid.as_uint64 = hv_build_irq_devid(pdev);
+
+	return hv_unmap_interrupt(hv_devid, hvirqe);
+}
+
+/* union hv_device_id is of size u64 */
+static int hv_unmap_interrupt(union hv_device_id hv_devid,
+			      struct hv_interrupt_entry *hvirqe)
+{
+	unsigned long flags;
+	struct hv_input_unmap_device_interrupt *input;
+	struct hv_interrupt_entry *intr_entry;
+	u64 status;
+
+	local_irq_save(flags);
+	input = *this_cpu_ptr(hyperv_pcpu_input_arg);
+
+	memset(input, 0, sizeof(*input));
+
+	if (hv_devid.device_type == HV_DEVICE_TYPE_LOGICAL)
+		input->partition_id = hv_iommu_get_curr_partid();
+	else
+		input->partition_id = hv_current_partition_id;
+
+	input->device_id = hv_devid.as_uint64;
+	intr_entry = &input->interrupt_entry;
+	*intr_entry = *hvirqe;
+
+	pr_err("Hyper-V: hv_unmap_interrupt called: device_id.as_uint64=%llu, device_type=%u, intr_entry: source:%u, address:%llu, data:%u\n",
+	       hv_devid.as_uint64, hv_devid.device_type,
+	       intr_entry->source, intr_entry->msi_entry.address,
+	       intr_entry->msi_entry.data);
+
+	status = hv_do_hypercall(HVCALL_UNMAP_DEVICE_INTERRUPT, input, NULL);
+	local_irq_restore(flags);
+
+	return hv_result(status);
+}
+
+/*
+ * Currently, direct attach must use logical device type and vice versa. Since
+ * vfio needs to bind irq at the very start before we know guest cpu/irq, we
+ * pick some default cpu/irq, and after the VM starts retarget will move it
+ * to relevant cpu and irq.
+ */
+#define HV_LOGDEV_DEF_CPU 0
+#define HV_LOGDEV_DEF_IRQ 32
+
+static int hv_map_spi_base = 137;
+
+static int hv_map_interrupt_hcall(u64 ptid, union hv_device_id device_id,
+				  bool level, int cpu, int vector,
+				  struct hv_interrupt_entry *ret_entry)
+{
+	struct hv_input_map_device_interrupt *input;
+	struct hv_output_map_device_interrupt *output;
+	struct hv_device_interrupt_descriptor *intr_desc;
+	unsigned long flags;
+	u64 status;
+	int nr_bank, var_size, i;
+	// int nr_bank = 0, var_size;
+
+	pr_err("Hyper-V: hv_map_interrupt_hcall called: device_id.as_uint64=%llu, device_type=%u, cpu=%d, vector=%d\n",
+	       device_id.as_uint64, device_id.device_type, cpu, vector);
+	local_irq_save(flags);
+
+	input = *this_cpu_ptr(hyperv_pcpu_input_arg);
+	output = *this_cpu_ptr(hyperv_pcpu_output_arg);
+
+	// if (device_id.device_type == HV_DEVICE_TYPE_LOGICAL) {
+	// 	cpu = HV_LOGDEV_DEF_CPU;
+	// 	vector = HV_LOGDEV_DEF_IRQ;
+	// }
+	// vector = hv_map_spi_base;
+	// cpu = 0;
+	// hv_map_spi_base++;
+
+	pr_err("Hyper-V: hv_map_interrupt_hcall using cpu=%d, vector=%d\n",
+	       cpu, vector);
+
+
+	memset(input, 0, sizeof(*input));
+	input->partition_id = ptid;
+	input->device_id = device_id.as_uint64;
+
+	intr_desc = &input->interrupt_descriptor;
+	intr_desc->interrupt_type = HV_ARM64_INTERRUPT_TYPE_FIXED;
+	intr_desc->vector_count = 1;
+	intr_desc->target.vector = vector;
+
+	if (level)
+		intr_desc->trigger_mode = HV_INTERRUPT_TRIGGER_MODE_LEVEL;
+	else
+		intr_desc->trigger_mode = HV_INTERRUPT_TRIGGER_MODE_EDGE;
+
+	intr_desc->target.vp_set.format = HV_GENERIC_SET_SPARSE_4K;
+	intr_desc->target.vp_set.valid_bank_mask = 1;
+	intr_desc->target.vp_set.bank_contents[0] = 1;
+	nr_bank = 1;//cpumask_to_vpset(&intr_desc->target.vp_set, cpumask_of(cpu));
+	if (nr_bank < 0) {
+		local_irq_restore(flags);
+		pr_err("%s: unable to generate VP set\n", __func__);
+		return HV_STATUS_INVALID_PARAMETER;
+	}
+	intr_desc->target.flags = HV_DEVICE_INTERRUPT_TARGET_PROCESSOR_SET;
+
+	/*
+	 * var-sized hypercall, var-size starts after vp_mask (thus
+	 * vp_set.format does not count, but vp_set.valid_bank_mask
+	 * does).
+	 */
+	var_size = nr_bank + 1;
+	// var_size = 0;
+
+	pr_err("HYPER-V: hv_map_interrupt_hcall ptid: %llu, device_id: %llu, intr_desc int_type: %u, vec_count: %u, trigger_mode: %u, target- vec: %u, valid_bank_mask: %llu, format: %llu, flags: %u, nr_bank: %d ",
+	       input->partition_id, input->device_id, intr_desc->interrupt_type, intr_desc->vector_count, intr_desc->trigger_mode, intr_desc->target.vector, intr_desc->target.vp_set.valid_bank_mask, intr_desc->target.vp_set.format, intr_desc->target.flags, nr_bank);
+	for (i = 0; i < nr_bank; i++)
+		pr_err(" bank_contents[%d]: %llu, ",
+		       i, intr_desc->target.vp_set.bank_contents[i]);
+
+	status = hv_do_rep_hypercall(HVCALL_MAP_DEVICE_INTERRUPT, 0, var_size,
+				     input, output);
+	*ret_entry = output->interrupt_entry;
+
+	pr_err("Hyper-V: hv_map_interrupt_hcall ret_entry: source:%u, address:%llu, data:%u\n", ret_entry->source, ret_entry->msi_entry.address, ret_entry->msi_entry.data);
+
+	local_irq_restore(flags);
+
+	return status;
+}
+
+
+static int hv_map_interrupt(u64 ptid, union hv_device_id device_id, bool level,
+			    int cpu, int vector,
+			    struct hv_interrupt_entry *ret_entry)
+{
+	u64 status;
+	int deposit_pgs = 16;		/* don't loop forever */
+
+	while (deposit_pgs--) {
+		status = hv_map_interrupt_hcall(ptid, device_id, level, cpu,
+						vector, ret_entry);
+
+		if (hv_result_oom(status)) {
+			status = hv_call_deposit_memory(NUMA_NO_NODE,
+							ptid, status);
+			if (!hv_result_success(status)) {
+				pr_err("%s deposit pages failed:%llx\n",
+				       __func__, status);
+				break;
+			}
+			continue;
+		}
+
+		break;
+	};
+
+	if (!hv_result_success(status))
+		hv_status_err(status, "\n");
+
+	return hv_result(status);
+}
+
+
+/**
+ * hv_map_msi_interrupt() - "Map" the MSI IRQ in the hypervisor.
+ * @data:      Describes the IRQ
+ * @out_entry: Hypervior (MSI) interrupt entry (can be NULL)
+ *
+ * Map the IRQ in the hypervisor by issuing a MAP_DEVICE_INTERRUPT hypercall.
+ */
+int hv_map_msi_interrupt(struct irq_data *data,
+			 struct hv_interrupt_entry *out_entry)
+{
+	pr_err("Hyper-V: hv_map_msi_interrupt called with data: irq:%d, hwirq:%lu\n", data->irq, data->hwirq);
+	struct msi_desc *msidesc;
+	struct pci_dev *pdev;
+	union hv_device_id hv_devid;
+	struct hv_interrupt_entry dummy;
+	int vector = hv_msi_get_int_vector(data);
+	int cpu;
+	u64 res, ptid;
+
+	msidesc = irq_data_get_msi_desc(data);
+	pdev = msi_desc_to_pci_dev(msidesc);
+	cpu = cpumask_first(irq_data_get_effective_affinity_mask(data));
+	hv_devid.as_uint64 = hv_build_irq_devid(pdev);
+
+	if (hv_devid.device_type == HV_DEVICE_TYPE_LOGICAL)
+		if (hv_pcidev_is_attached_dev(pdev))
+			ptid = hv_iommu_get_curr_partid();
+		else
+			/* Device actually on l1vh dom0, not passthru'd to vm */
+			ptid = hv_current_partition_id;
+	else
+		ptid = hv_current_partition_id;
+
+	/* prints error in case of failure */
+	res = hv_map_interrupt(ptid, hv_devid, false, cpu, vector,
+			       out_entry ? out_entry : &dummy);
+
+	return hv_result_to_errno(res);
+}
+EXPORT_SYMBOL_GPL(hv_map_msi_interrupt);
+
+static void hv_irq_compose_msi_msg_old(struct irq_data *data,
+					  struct msi_msg *msg) {};
+
+void hv_irq_compose_msi_msg(struct irq_data *data, struct msi_msg *msg)
+{
+	struct msi_desc *msidesc;
+	struct pci_dev *pdev;
+	struct hv_interrupt_entry *stored_entry;
+	struct tran_int_desc *int_desc;
+	u64 status;
+	msidesc = irq_data_get_msi_desc(data);
+	pdev = msi_desc_to_pci_dev(msidesc);
+	if (data->chip_data) {
+		/*
+		 * This interrupt is already mapped. Let's unmap first.
+		 *
+		 * We don't use retarget interrupt hypercalls here because
+		 * Microsoft Hypervisor doens't allow root to change the vector
+		 * or specify VPs outside of the set that is initially used
+		 * during mapping.
+		 */
+		stored_entry = data->chip_data;
+		data->chip_data = NULL;
+
+		status = hv_unmap_msi_interrupt(pdev, stored_entry);
+
+		kfree(stored_entry);
+
+		if (status != HV_STATUS_SUCCESS) {
+			hv_status_debug(status, "failed to unmap\n");
+			return;
+		}
+	}
+
+	stored_entry = kzalloc(sizeof(*stored_entry), GFP_ATOMIC);
+	if (!stored_entry) {
+		pr_debug("%s: failed to allocate chip data\n", __func__);
+		return;
+	}
+
+	status = hv_map_msi_interrupt(data, stored_entry);
+	if (status != HV_STATUS_SUCCESS) {
+		kfree(stored_entry);
+		return;
+	}
+
+	data->chip_data = stored_entry;
+	int_desc = data->chip_data;
+	msg->address_hi = 0;
+	msg->address_lo = lower_32_bits(stored_entry->msi_entry.address);
+	msg->data = stored_entry->msi_entry.data;
+}
+EXPORT_SYMBOL_GPL(hv_irq_compose_msi_msg);
+
 /* Compose an msi message for a directly attached device */
 static void hv_dda_compose_msi_msg(struct irq_data *irq_data,
 				   struct msi_desc *msi_desc,
@@ -2185,7 +2464,7 @@ static void hv_dda_compose_msi_msg(struct irq_data *irq_data,
 		goto outerr;
 
 	/* will unmap if needed and also update irq_data->chip_data */
-	hv_irq_compose_msi_msg(irq_data, msg);
+	hv_irq_compose_msi_msg_old(irq_data, msg);
 
 	put_pcichild(hpdev);
 	return;
