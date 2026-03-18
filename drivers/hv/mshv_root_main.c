@@ -642,7 +642,65 @@ mshv_partition_region_by_gfn(struct mshv_partition *partition, u64 gfn)
 	return NULL;
 }
 
-#ifdef CONFIG_X86_64
+/*
+ * Check if uaddr is for mmio range. If yes, return 0 with mmio_pfn filled in
+ * else just return -errno.
+ */
+static int mshv_chk_get_mmio_start_pfn(struct mshv_partition *pt, u64 gfn,
+				       u64 *mmio_pfnp)
+{
+	struct vm_area_struct *vma;
+	bool is_mmio;
+	u64 uaddr;
+	struct mshv_mem_region *mreg;
+	struct follow_pfnmap_args pfnmap_args;
+	int rc = -EINVAL;
+
+	/*
+	 * Do not allow mem region to be deleted beneath us. VFIO uses
+	 * useraddr vma to lookup pci bar pfn.
+	 */
+	spin_lock(&pt->pt_mem_regions_lock);
+
+	/* Get the region again under the lock */
+	mreg = mshv_partition_region_by_gfn(pt, gfn);
+	if (mreg == NULL || mreg->type != MSHV_REGION_TYPE_MMIO)
+		goto unlock_pt_out;
+
+	uaddr = mreg->start_uaddr +
+		((gfn - mreg->start_gfn) << HV_HYP_PAGE_SHIFT);
+
+	mmap_read_lock(current->mm);
+	vma = vma_lookup(current->mm, uaddr);
+	is_mmio = vma ? !!(vma->vm_flags & (VM_IO | VM_PFNMAP)) : 0;
+	if (!is_mmio)
+		goto unlock_mmap_out;
+
+	pfnmap_args.vma = vma;
+	pfnmap_args.address = uaddr;
+
+	rc = follow_pfnmap_start(&pfnmap_args);
+	if (rc) {
+		rc = fixup_user_fault(current->mm, uaddr, FAULT_FLAG_WRITE,
+				      NULL);
+		if (rc)
+			goto unlock_mmap_out;
+
+		rc = follow_pfnmap_start(&pfnmap_args);
+		if (rc)
+			goto unlock_mmap_out;
+	}
+
+	*mmio_pfnp = pfnmap_args.pfn;
+	follow_pfnmap_end(&pfnmap_args);
+
+unlock_mmap_out:
+	mmap_read_unlock(current->mm);
+unlock_pt_out:
+	spin_unlock(&pt->pt_mem_regions_lock);
+	return rc;
+}
+
 static struct mshv_mem_region *
 mshv_partition_region_by_gfn_get(struct mshv_partition *p, u64 gfn)
 {
@@ -659,6 +717,81 @@ mshv_partition_region_by_gfn_get(struct mshv_partition *p, u64 gfn)
 	return region;
 }
 
+#ifdef CONFIG_X86_64
+
+/*
+ * At present, the only unmapped gpa is mmio space. Verify if it's mmio
+ * and resolve if possible.
+ * Returns: True if valid mmio intercept and it was handled, else false
+ */
+static bool mshv_handle_unmapped_gpa(struct mshv_vp *vp)
+{
+	struct hv_message *hvmsg = vp->vp_intercept_msg_page;
+	struct hv_x64_memory_intercept_message *msg;
+	union hv_x64_memory_access_info accinfo;
+	u64 gfn, mmio_spa, numpgs;
+	struct mshv_mem_region *mreg;
+	int rc;
+	struct mshv_partition *pt = vp->vp_partition;
+
+	msg = (struct hv_x64_memory_intercept_message *)hvmsg->u.payload;
+	accinfo = msg->memory_access_info;
+
+	if (!accinfo.gva_gpa_valid)
+		return false;
+
+	/* Do a fast check and bail if non mmio intercept */
+	gfn = msg->guest_physical_address >> HV_HYP_PAGE_SHIFT;
+	mreg = mshv_partition_region_by_gfn(pt, gfn);
+	if (mreg == NULL || mreg->type != MSHV_REGION_TYPE_MMIO)
+		return false;
+
+	rc = mshv_chk_get_mmio_start_pfn(pt, gfn, &mmio_spa);
+	if (rc)
+		return false;
+
+	if (!hv_nofull_mmio) {		/* default case */
+		gfn = mreg->start_gfn;
+		mmio_spa = mmio_spa - (gfn - mreg->start_gfn);
+		numpgs = mreg->nr_pages;
+	} else
+		numpgs = 1;
+
+	rc = hv_call_map_mmio_pages(pt->pt_id, gfn, mmio_spa, numpgs);
+
+	return rc == 0;
+}
+
+static u64 mshv_get_gpa_intercept_gfn(struct mshv_vp *vp)
+{
+	struct hv_x64_memory_intercept_message *msg;
+	u64 gfn;
+
+	msg = (struct hv_x64_memory_intercept_message *)
+		vp->vp_intercept_msg_page->u.payload;
+
+	gfn = HVPFN_DOWN(msg->guest_physical_address);
+	return gfn;
+}
+
+#elif defined(CONFIG_ARM64)
+
+static bool mshv_handle_unmapped_gpa(struct mshv_vp *vp) { return false; }
+
+static u64 mshv_get_gpa_intercept_gfn(struct mshv_vp *vp)
+{
+	struct hv_arm64_memory_intercept_message *msg;
+	u64 gfn;
+
+	msg = (struct hv_arm64_memory_intercept_message *)
+		vp->vp_intercept_msg_page->u.payload;
+
+	gfn = HVPFN_DOWN(msg->guest_physical_address);
+	return gfn;
+}
+
+#endif /* CONFIG_X86_64 */
+
 /**
  * mshv_handle_gpa_intercept - Handle GPA (Guest Physical Address) intercepts.
  * @vp: Pointer to the virtual processor structure.
@@ -674,17 +807,12 @@ static bool mshv_handle_gpa_intercept(struct mshv_vp *vp)
 {
 	struct mshv_partition *p = vp->vp_partition;
 	struct mshv_mem_region *region;
+	struct hv_x64_memory_intercept_message *msg;
 	bool ret;
 	u64 gfn;
-#if defined(CONFIG_X86_64)
-	struct hv_x64_memory_intercept_message *msg =
-		(struct hv_x64_memory_intercept_message *)
+
+	msg = (struct hv_x64_memory_intercept_message *)
 		vp->vp_intercept_msg_page->u.payload;
-#elif defined(CONFIG_ARM64)
-	struct hv_arm64_memory_intercept_message *msg =
-		(struct hv_arm64_memory_intercept_message *)
-		vp->vp_intercept_msg_page->u.payload;
-#endif
 
 	gfn = HVPFN_DOWN(msg->guest_physical_address);
 
@@ -702,7 +830,9 @@ static bool mshv_handle_gpa_intercept(struct mshv_vp *vp)
 
 	return ret;
 }
+
 #else  /* CONFIG_X86_64 */
+static bool mshv_handle_unmapped_gpa(struct mshv_vp *vp) { return false; }
 static bool mshv_handle_gpa_intercept(struct mshv_vp *vp) { return false; }
 #endif /* CONFIG_X86_64 */
 

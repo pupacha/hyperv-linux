@@ -827,7 +827,7 @@ struct hv_x64_memory_intercept_message {
 union hv_arm64_vp_execution_state {
 	u16 as_uint16;
 	struct {
-		u16 cpl:2; /* Exception Level (EL) */
+		u16 cpl:2;
 		u16 debug_active:1;
 		u16 interruption_pending:1;
 		u16 vtl:4;
@@ -835,7 +835,6 @@ union hv_arm64_vp_execution_state {
 		u16 reserved:7;
 	} __packed;
 };
-
 struct hv_arm64_intercept_message_header {
 	u32 vp_index;
 	u8 instruction_length;
@@ -844,7 +843,6 @@ struct hv_arm64_intercept_message_header {
 	u64 pc;
 	u64 cpsr;
 } __packed;
-
 union hv_arm64_memory_access_info {
 	u8 as_uint8;
 	struct {
@@ -854,7 +852,6 @@ union hv_arm64_memory_access_info {
 		u8 reserved:5;
 	} __packed;
 };
-
 struct hv_arm64_memory_intercept_message {
 	struct hv_arm64_intercept_message_header header;
 	u32 cache_type; /* enum hv_cache_type */
@@ -867,7 +864,6 @@ struct hv_arm64_memory_intercept_message {
 	u64 guest_physical_address;
 	u64 syndrome;
 } __packed;
-
 #endif /* CONFIG_ARM64 */
 
 /*
