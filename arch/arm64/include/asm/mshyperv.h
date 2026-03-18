@@ -30,6 +30,11 @@ void hv_set_vpreg(u32 reg, u64 value);
 u64 hv_get_vpreg(u32 reg);
 void hv_get_vpreg_128(u32 reg, struct hv_get_vp_registers_output *result);
 
+#ifdef CONFIG_HYPERV_IOMMU_ARM
+u64 hv_build_devid_oftype(struct pci_dev *pdev, enum hv_device_type type); 
+u64 hv_iommu_get_curr_partid(void);
+#endif
+
 static inline void hv_set_msr(unsigned int reg, u64 value)
 {
 	hv_set_vpreg(reg, value);
@@ -56,17 +61,11 @@ static inline u64 hv_get_non_nested_msr(unsigned int reg)
 struct irq_data;
 struct msi_msg;
 struct pci_dev;
-static inline void hv_irq_compose_msi_msg(struct irq_data *data,
-					  struct msi_msg *msg) {};
-static inline int hv_unmap_msi_interrupt(struct pci_dev *pdev,
-					struct hv_interrupt_entry *hvirqe)
-{
-	return -EOPNOTSUPP;
-}
-static inline bool hv_pcidev_is_attached_dev(struct pci_dev *pdev)
-{
-	return false;
-}
+void hv_irq_compose_msi_msg(struct irq_data *data,
+					  struct msi_msg *msg);
+int hv_unmap_msi_interrupt(struct pci_dev *pdev,
+					struct hv_interrupt_entry *hvirqe);
+bool hv_pcidev_is_attached_dev(struct pci_dev *pdev);
 
 /* SMCCC hypercall parameters */
 #define HV_SMCCC_FUNC_NUMBER	1

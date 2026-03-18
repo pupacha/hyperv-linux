@@ -361,6 +361,20 @@ config HYPERV_IOMMU
 	  Stub IOMMU driver to handle IRQs to support Hyper-V Linux
 	  guest and root partitions.
 
+config HYPERV_IOMMU_ARM
+	bool "Microsoft Hypervisor ARM64 IOMMU for L1VH"
+	depends on HYPERV && ARM64
+	select IOMMU_API
+	select IOMMU_DMA
+	select DMA_OPS
+	select IOMMU_IOVA
+	default HYPERV
+	help
+	  IOMMU driver for Microsoft Hypervisor on ARM64 platforms running
+	  as L1VH (Level 1 Virtual Host). Supports direct device attachment
+	  model for guest VM device passthrough. Does not support IRQ remapping
+	  or S2 device domains which are x86-specific features.
+
 config VIRTIO_IOMMU
 	tristate "Virtio IOMMU driver"
 	depends on VIRTIO
