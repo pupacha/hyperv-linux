@@ -619,8 +619,6 @@ mshv_partition_region_by_gfn(struct mshv_partition *partition, u64 gfn)
 	return NULL;
 }
 
-#ifdef CONFIG_X86_64
-
 /*
  * Check if uaddr is for mmio range. If yes, return 0 with mmio_pfn filled in
  * else just return -errno.
@@ -680,6 +678,24 @@ unlock_pt_out:
 	return rc;
 }
 
+static struct mshv_mem_region *
+mshv_partition_region_by_gfn_get(struct mshv_partition *p, u64 gfn)
+{
+	struct mshv_mem_region *region;
+
+	spin_lock(&p->pt_mem_regions_lock);
+	region = mshv_partition_region_by_gfn(p, gfn);
+	if (!region || !mshv_region_get(region)) {
+		spin_unlock(&p->pt_mem_regions_lock);
+		return NULL;
+	}
+	spin_unlock(&p->pt_mem_regions_lock);
+
+	return region;
+}
+
+#ifdef CONFIG_X86_64
+
 /*
  * At present, the only unmapped gpa is mmio space. Verify if it's mmio
  * and resolve if possible.
@@ -723,21 +739,35 @@ static bool mshv_handle_unmapped_gpa(struct mshv_vp *vp)
 	return rc == 0;
 }
 
-static struct mshv_mem_region *
-mshv_partition_region_by_gfn_get(struct mshv_partition *p, u64 gfn)
+static u64 mshv_get_gpa_intercept_gfn(struct mshv_vp *vp)
 {
-	struct mshv_mem_region *region;
+	struct hv_x64_memory_intercept_message *msg;
+	u64 gfn;
 
-	spin_lock(&p->pt_mem_regions_lock);
-	region = mshv_partition_region_by_gfn(p, gfn);
-	if (!region || !mshv_region_get(region)) {
-		spin_unlock(&p->pt_mem_regions_lock);
-		return NULL;
-	}
-	spin_unlock(&p->pt_mem_regions_lock);
+	msg = (struct hv_x64_memory_intercept_message *)
+		vp->vp_intercept_msg_page->u.payload;
 
-	return region;
+	gfn = HVPFN_DOWN(msg->guest_physical_address);
+	return gfn;
 }
+
+#elif defined(CONFIG_ARM64)
+
+static bool mshv_handle_unmapped_gpa(struct mshv_vp *vp) { return false; }
+
+static u64 mshv_get_gpa_intercept_gfn(struct mshv_vp *vp)
+{
+	struct hv_arm64_memory_intercept_message *msg;
+	u64 gfn;
+
+	msg = (struct hv_arm64_memory_intercept_message *)
+		vp->vp_intercept_msg_page->u.payload;
+
+	gfn = HVPFN_DOWN(msg->guest_physical_address);
+	return gfn;
+}
+
+#endif /* CONFIG_X86_64 */
 
 /**
  * mshv_handle_gpa_intercept - Handle GPA (Guest Physical Address) intercepts.
@@ -754,14 +784,9 @@ static bool mshv_handle_gpa_intercept(struct mshv_vp *vp)
 {
 	struct mshv_partition *p = vp->vp_partition;
 	struct mshv_mem_region *region;
-	struct hv_x64_memory_intercept_message *msg;
-	bool ret;
 	u64 gfn;
 
-	msg = (struct hv_x64_memory_intercept_message *)
-		vp->vp_intercept_msg_page->u.payload;
-
-	gfn = HVPFN_DOWN(msg->guest_physical_address);
+	gfn = mshv_get_gpa_intercept_gfn(vp);
 
 	region = mshv_partition_region_by_gfn_get(p, gfn);
 	if (!region)
@@ -778,10 +803,6 @@ static bool mshv_handle_gpa_intercept(struct mshv_vp *vp)
 	return ret;
 }
 
-#else  /* CONFIG_X86_64 */
-static bool mshv_handle_unmapped_gpa(struct mshv_vp *vp) { return false; }
-static bool mshv_handle_gpa_intercept(struct mshv_vp *vp) { return false; }
-#endif /* CONFIG_X86_64 */
 
 static bool mshv_vp_handle_intercept(struct mshv_vp *vp)
 {
