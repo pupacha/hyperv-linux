@@ -16,6 +16,7 @@
 #include <linux/workqueue.h>
 #include <linux/eventfd.h>
 #include <linux/irq.h>
+#include <linux/msi.h>
 
 #if IS_ENABLED(CONFIG_X86_64)
 #include <asm/apic.h>
@@ -558,7 +559,7 @@ static void mshv_irqfd_update(struct mshv_partition *pt,
 						    irqfd->irqfd_irqnum);
 	mshv_copy_girq_info(&irqfd->irqfd_girq_ent, &irqfd->irqfd_lapic_irq);
 
-	mshv_check_do_guest_remap(irqfd);
+	// mshv_check_do_guest_remap(irqfd);
 	write_seqcount_end(&irqfd->irqfd_irqe_sc);
 }
 
@@ -588,7 +589,73 @@ static void mshv_irqfd_queue_proc(struct file *file, wait_queue_head_t *wqh,
 	add_wait_queue_priority(wqh, &irqfd->irqfd_wait);
 }
 
-#ifdef CONFIG_X86
+// #ifdef CONFIG_X86
+
+static void mshv_map_interrupt(struct mshv_irqfd *irqfd)
+{
+	struct irq_bypass_producer *prod;
+	struct irq_data *irqdata;
+	struct mshv_lapic_irq *lapic_irq;
+	struct msi_msg msg;
+	struct hv_interrupt_entry *int_e;
+	unsigned int irq;
+
+	if (!irqfd || !irqfd->irqfd_bypass_prod)
+		return ;
+
+	if (!irqfd->irqfd_girq_ent.girq_entry_valid ||
+	    !irqfd->irqfd_passthru_dev || hv_no_attdev)
+		return ;
+
+	prod = irqfd->irqfd_bypass_prod;
+	irq = prod->irq;
+	lapic_irq = &irqfd->irqfd_lapic_irq;
+
+	irqdata = irq_get_irq_data(irq);
+	if (!irqdata) {
+		pr_err("Hyper-V: mshv_map_interrupt: no irq_data for irq %u\n", irq);
+		return;
+	}
+
+	/*
+	 * Override the vector with the guest's lapic vector.
+	 * On ARM64, hv_msi_get_int_vector() reads from parent_data->hwirq.
+	 */
+	if (irqdata->parent_data)
+		irqdata->parent_data->hwirq = lapic_irq->lapic_vector;
+	else
+		irqdata->hwirq = lapic_irq->lapic_vector;
+
+	/* Set CPU affinity to CPU 0 */
+	if (irqdata->common && irqdata->common->effective_affinity)
+		cpumask_set_cpu(0, irqdata->common->effective_affinity);
+
+	pr_err("Hyper-V: mshv_map_interrupt: irq %u, setting vector to %u, cpu to 0\n",
+	       irq, lapic_irq->lapic_vector);
+
+	if (irqdata->chip_data) {
+		int_e = irqdata->chip_data;
+		pr_err("Hyper-V: mshv_map_interrupt: chip_data present irq:%u, hwirq:%lu, source:%u, address:%llu, data:%u \n",
+		       irq, lapic_irq->lapic_vector, int_e->source, int_e->msi_entry.address, int_e->msi_entry.data);
+		return;
+	}
+	/* Compose the MSI message via Hyper-V hypercall */
+	hv_irq_compose_msi_msg(irqdata, &msg);
+
+       /* something wrong with the call, MAP might have failed if address_lo is 0; so avoid writing
+        *
+        * same irqfd is getting called twice. it shouldn't. and second call fails (Expected).
+        * avoid writing when it fails
+        * */
+       if (msg.address_lo != 0)
+               /* Write the MSI message to the device */
+               pci_write_msi_msg(irq, &msg);
+
+	pr_debug("Hyper-V: mshv_map_interrupt: irq %u mapped, addr=0x%x data=0x%x\n",
+		 irq, msg.address_lo, msg.data);
+
+}
+
 static int mshv_irq_bypass_add_producer(struct irq_bypass_consumer *cons,
 				      struct irq_bypass_producer *prod)
 {
@@ -598,7 +665,8 @@ static int mshv_irq_bypass_add_producer(struct irq_bypass_consumer *cons,
 	irqfd->irqfd_bypass_prod = prod;
 	irqfd->irqfd_passthru_dev = true;
 
-	mshv_check_do_guest_remap(irqfd);
+	mshv_map_interrupt(irqfd);
+	// mshv_check_do_guest_remap(irqfd);
 
 	return 0;
 }
@@ -629,9 +697,9 @@ static void mshv_setup_irq_bypass(struct mshv_irqfd *irqfd)
 		       consumer->token, ret);
 }
 
-#else
-static void mshv_setup_irq_bypass(struct mshv_irqfd *irqfd) { }
-#endif /* #ifdef CONFIG_X86 */
+// #else
+// static void mshv_setup_irq_bypass(struct mshv_irqfd *irqfd) { }
+// #endif /* #ifdef CONFIG_X86 */
 
 static int mshv_irqfd_assign(struct mshv_partition *pt,
 			     struct mshv_user_irqfd *args)

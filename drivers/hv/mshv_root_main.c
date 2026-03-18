@@ -776,7 +776,43 @@ static u64 mshv_get_gpa_intercept_gfn(struct mshv_vp *vp)
 
 #elif defined(CONFIG_ARM64)
 
-static bool mshv_handle_unmapped_gpa(struct mshv_vp *vp) { return false; }
+bool hv_no_attdev = false;	/* no direct attach on arm */
+EXPORT_SYMBOL_GPL(hv_no_attdev);
+
+static bool mshv_handle_unmapped_gpa(struct mshv_vp *vp)
+{
+	struct hv_message *hvmsg = vp->vp_intercept_msg_page;
+	struct hv_arm64_memory_intercept_message *msg;
+	union hv_arm64_memory_access_info accinfo;
+	u64 gfn, mmio_spa, numpgs;
+	struct mshv_mem_region *mreg;
+	int rc;
+	struct mshv_partition *pt = vp->vp_partition;
+
+	msg = (struct hv_arm64_memory_intercept_message *)hvmsg->u.payload;
+	accinfo = msg->memory_access_info;
+
+	/* Do a fast check and bail if non mmio intercept */
+	gfn = msg->guest_physical_address >> HV_HYP_PAGE_SHIFT;
+	mreg = mshv_partition_region_by_gfn(pt, gfn);
+	if (mreg == NULL || mreg->type != MSHV_REGION_TYPE_MMIO)
+		return false;
+
+	rc = mshv_chk_get_mmio_start_pfn(pt, gfn, &mmio_spa);
+	if (rc)
+		return false;
+
+	if (!hv_nofull_mmio) {		/* default case */
+		gfn = mreg->start_gfn;
+		mmio_spa = mmio_spa - (gfn - mreg->start_gfn);
+		numpgs = mreg->nr_pages;
+	} else
+		numpgs = 1;
+
+	rc = hv_call_map_mmio_pages(pt->pt_id, gfn, mmio_spa, numpgs);
+
+	return rc == 0;
+}
 
 static u64 mshv_get_gpa_intercept_gfn(struct mshv_vp *vp)
 {
