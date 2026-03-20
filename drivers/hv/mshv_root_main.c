@@ -843,7 +843,6 @@ static bool mshv_handle_gpa_intercept(struct mshv_vp *vp)
 {
 	struct mshv_partition *p = vp->vp_partition;
 	struct mshv_mem_region *region;
-	struct hv_x64_memory_intercept_message *msg;
 	bool ret;
 	u64 gfn;
 

@@ -63,8 +63,9 @@ static u64 hv_build_devid_type_logical(struct pci_dev *pdev)
 }
 static void hv_iommu_detach_dev(struct iommu_domain *immdom,
 				struct device *dev);
-static size_t hv_iommu_unmap(struct iommu_domain *d, unsigned long iova,
-			    size_t size, struct iommu_iotlb_gather *gather);
+static size_t hv_iommu_unmap_pages(struct iommu_domain *immdom, ulong iova,
+				   size_t pgsize, size_t pgcount,
+				   struct iommu_iotlb_gather *gather);
 
 u64 hv_build_devid_oftype(struct pci_dev *pdev, enum hv_device_type type)
 {
@@ -216,19 +217,17 @@ static bool hv_iommu_capable(struct device *dev, enum iommu_cap cap)
 	}
 }
 
-static struct iommu_domain *hv_iommu_domain_alloc(unsigned int type)
+static struct iommu_domain *hv_iommu_domain_alloc_identity(struct device *dev)
 {
-	pr_err("Hyper-V ARM64: hv_iommu_domain_alloc: type: %u \n", type);
+	return &hv_def_identity_dom.iommu_dom;
+}
+
+static struct iommu_domain *hv_iommu_domain_alloc_paging(struct device *dev)
+{
+	// pr_err("Hyper-V ARM64: hv_iommu_domain_alloc: type: %u \n", type);
 	// msleep(500);
 	struct hv_domain *hvdom;
 	int rc;
-
-	/* during boot, all devices are attached to this */
-	if (type == IOMMU_DOMAIN_IDENTITY)
-		return &hv_def_identity_dom.iommu_dom;
-
-	if (type == IOMMU_DOMAIN_BLOCKED)
-		return &hv_null_dom.iommu_dom;
 
 	/*
 	 * L1VH on ARM64 does not support host device passthrough (DPDK, etc.)
@@ -245,9 +244,6 @@ static struct iommu_domain *hv_iommu_domain_alloc(unsigned int type)
 
 	spin_lock_init(&hvdom->mappings_lock);
 	hvdom->mappings_tree = RB_ROOT_CACHED;
-
-	if (type == IOMMU_DOMAIN_DMA && iommu_get_dma_cookie(&hvdom->iommu_dom))
-		goto out_free;
 
 	if (++unique_id == 0)   /* avoid 0, reserved for default */
 		unique_id++;
@@ -270,7 +266,7 @@ static struct iommu_domain *hv_iommu_domain_alloc(unsigned int type)
 
 	// hvdom->attached_dom = true; /* L1VH always uses direct attach */
 
-	pr_err("Hyper-V ARM64: hv_iommu_domain_alloc [DONE]: type: %u, hvdom->domid_num:%u \n", type, hvdom->domid_num);
+	// pr_err("Hyper-V ARM64: hv_iommu_domain_alloc [DONE]: type: %u, hvdom->domid_num:%u \n", type, hvdom->domid_num);
 	// msleep(500);
 	return &hvdom->iommu_dom;
 
@@ -357,8 +353,8 @@ int hv_iommu_direct_attach_device(struct pci_dev *pdev)
 
 
 	do {
-		pr_err("Hyper-V ARM64: hv_iommu_direct_attach_device: calling HVCALL_ATTACH_DEVICE\n");
-		msleep(200);
+		// pr_err("Hyper-V ARM64: hv_iommu_direct_attach_device: calling HVCALL_ATTACH_DEVICE\n");
+		// msleep(200);
 		local_irq_save(flags);
 		input = *this_cpu_ptr(hyperv_pcpu_input_arg);
 		memset(input, 0, sizeof(*input));
@@ -377,13 +373,12 @@ int hv_iommu_direct_attach_device(struct pci_dev *pdev)
 		status = hv_do_hypercall(HVCALL_ATTACH_DEVICE, input, NULL);
 		local_irq_restore(flags);
 
-		if (hv_result_oom(status)) {
-			pr_err("Hyper-V ARM64: hv_iommu_direct_attach_device: statusL hv_oom\n");
-			rc = hv_call_deposit_memory(NUMA_NO_NODE, ptid, status);
+		if (hv_result(status) == HV_STATUS_INSUFFICIENT_MEMORY) {
+			rc = hv_call_deposit_pages(NUMA_NO_NODE, ptid, 1);
 			if (rc)
 				break;
 		}
-	} while (hv_result_oom(status));
+	} while (hv_result(status) == HV_STATUS_INSUFFICIENT_MEMORY);
 
 	if (!hv_result_success(status))
 		pr_err("%s: hypercall failed, status 0x%llx\n", __func__,
@@ -394,7 +389,8 @@ int hv_iommu_direct_attach_device(struct pci_dev *pdev)
 EXPORT_SYMBOL_GPL(hv_iommu_direct_attach_device);
 
 /* Attach a device to a domain (L1VH uses direct attach only) */
-static int hv_iommu_attach_dev(struct iommu_domain *immdom, struct device *dev)
+static int hv_iommu_attach_dev(struct iommu_domain *immdom, struct device *dev,
+			       struct iommu_domain *old)
 {
 	struct pci_dev *pdev;
 	int rc, rc1;
@@ -589,34 +585,31 @@ static u64 hv_iommu_map_pgs(struct hv_domain *hvdom,
 }
 
 /*
- * For L1VH ARM64 with direct attach model, mappings are tracked locally
- * but the actual IOMMU translation happens through the guest page tables
- * which the hypervisor uses directly. No explicit map hypercalls needed.
+ * The core VFIO code loops over memory ranges calling this function with
+ * the largest size from HV_IOMMU_PGSIZES. cond_resched() is in vfio_iommu_map.
  */
-static int hv_iommu_map(struct iommu_domain *immdom, unsigned long iova,
-			phys_addr_t paddr, size_t size, int prot, gfp_t gfp)
+static int hv_iommu_map_pages(struct iommu_domain *immdom, ulong iova,
+			      phys_addr_t paddr, size_t pgsize, size_t pgcount,
+			      int prot, gfp_t gfp, size_t *mapped)
 {
 	u32 map_flags;
-	unsigned long npages, done = 0;
 	int ret;
-	struct hv_domain *hvdom = to_hv_domain(immdom);
 	u64 status;
-	//pr_err("HYPER-V ARM64: hv_iommu_map: %u \n", hvdom->domid_num);
-	//msleep(100);
+	unsigned long npages, done = 0;
+	struct hv_domain *hvdom = to_hv_domain(immdom);
+	size_t size = pgsize * pgcount;
 
-	/* Reject size that's not a whole page */
-	if (size & ~HV_HYP_PAGE_MASK)
-		return -EINVAL;
-
-	map_flags = HV_MAP_GPA_READABLE; /* Always required */
+	map_flags = HV_MAP_GPA_READABLE;	/* required */
 	map_flags |= prot & IOMMU_WRITE ? HV_MAP_GPA_WRITABLE : 0;
 
 	ret = hv_iommu_add_tree_mapping(hvdom, iova, paddr, size, map_flags);
 	if (ret)
 		return ret;
 
-	if (hvdom->attached_dom)
+	if (hvdom->attached_dom) {
+		*mapped = size;
 		return 0;
+	}
 
 	npages = size >> HV_HYP_PAGE_SHIFT;
 	while (done < npages) {
@@ -630,7 +623,7 @@ static int hv_iommu_map(struct iommu_domain *immdom, unsigned long iova,
 		iova = iova + (completed << HV_HYP_PAGE_SHIFT);
 		paddr = paddr + (completed << HV_HYP_PAGE_SHIFT);
 
-		if (hv_result_oom(status)) {
+		if (hv_result(status) == HV_STATUS_INSUFFICIENT_MEMORY) {
 			ret = hv_call_deposit_pages(NUMA_NO_NODE,
 						    hv_current_partition_id,
 						    256);
@@ -644,29 +637,34 @@ static int hv_iommu_map(struct iommu_domain *immdom, unsigned long iova,
 	if (!hv_result_success(status)) {
 		size_t done_size = done << HV_HYP_PAGE_SHIFT;
 
-		pr_err("%s: iommu map failed. pgs:%lx/%lx iova:%lx st:%llx\n",
-		       __func__, done, npages, iova, status);
-
+		hv_status_err(status, "pgs:%lx/%lx iova:%lx\n",
+			      done, npages, iova);
 		/*
 		 * lookup tree has all mappings [0 - size-1]. Below unmap will
 		 * only remove from [0 - done], we need to remove second chunk
 		 * [done+1 - size-1].
 		 */
 		hv_iommu_del_tree_mappings(hvdom, iova, size - done_size);
-		hv_iommu_unmap(immdom, iova - done_size, done_size, NULL);
-	}
+		hv_iommu_unmap_pages(immdom, iova - done_size, pgsize,
+				     done, NULL);
+		if (mapped)
+			*mapped = 0;
+	} else
+		if (mapped)
+			*mapped = size;
 
 	return hv_result_to_errno(status);
 }
 
-static size_t hv_iommu_unmap(struct iommu_domain *immdom, unsigned long iova,
-			   size_t size, struct iommu_iotlb_gather *gather)
+static size_t hv_iommu_unmap_pages(struct iommu_domain *immdom, ulong iova,
+				   size_t pgsize, size_t pgcount,
+				   struct iommu_iotlb_gather *gather)
 {
-	size_t unmapped;
-	struct hv_domain *hvdom = to_hv_domain(immdom);
 	unsigned long flags, npages;
 	struct hv_input_unmap_device_gpa_pages *input;
 	u64 status;
+	struct hv_domain *hvdom = to_hv_domain(immdom);
+	size_t unmapped, size = pgsize * pgcount;
 
 	unmapped = hv_iommu_del_tree_mappings(hvdom, iova, size);
 	if (unmapped < size)
@@ -687,17 +685,14 @@ static size_t hv_iommu_unmap(struct iommu_domain *immdom, unsigned long iova,
 	input->device_domain.domain_id.id = hvdom->domid_num;
 	input->target_device_va_base = iova;
 
-	/* Unmap `npages` pages starting from VA base */
 	status = hv_do_rep_hypercall(HVCALL_UNMAP_DEVICE_GPA_PAGES, npages,
 				     0, input, NULL);
-
 	local_irq_restore(flags);
 
 	if (!hv_result_success(status))
-		pr_err("%s: hypercall failed, status 0x%llx\n", __func__,
-		       status);
+		hv_status_err(status, "\n");
 
-	return hv_result_success(status) ? unmapped : 0;
+	return unmapped;
 }
 
 static phys_addr_t hv_iommu_iova_to_phys(struct iommu_domain *immdom,
@@ -770,12 +765,12 @@ static struct iommu_device *hv_iommu_probe_device(struct device *dev)
 
 static void hv_iommu_probe_finalize(struct device *dev)
 {
-	pr_err("Hyper-V ARM64: hv_iommu_probe_finalize: dev->id=%u \n", dev->id);
-	msleep(100);
+	// pr_err("Hyper-V ARM64: hv_iommu_probe_finalize: dev->id=%u \n", dev->id);
+	// msleep(100);
 	struct iommu_domain *immdom = iommu_get_domain_for_dev(dev);
 
 	if (immdom && immdom->type == IOMMU_DOMAIN_DMA)
-		iommu_setup_dma_ops(dev, 0, U64_MAX);
+		iommu_setup_dma_ops(dev);
 	else
 		set_dma_ops(dev, NULL);
 }
@@ -822,7 +817,8 @@ static int hv_iommu_def_domain_type(struct device *dev)
 
 static struct iommu_ops hv_iommu_ops = {
 	.capable	    = hv_iommu_capable,
-	.domain_alloc	    = hv_iommu_domain_alloc,
+	.domain_alloc_identity	    = hv_iommu_domain_alloc_identity,
+	.domain_alloc_paging	= hv_iommu_domain_alloc_paging,
 	.probe_device	    = hv_iommu_probe_device,
 	.probe_finalize     = hv_iommu_probe_finalize,
 	.release_device     = hv_iommu_release_device,
@@ -831,12 +827,11 @@ static struct iommu_ops hv_iommu_ops = {
 	.get_resv_regions   = hv_iommu_get_resv_regions,
 	.default_domain_ops = &(const struct iommu_domain_ops) {
 		.attach_dev   = hv_iommu_attach_dev,
-		.map	      = hv_iommu_map,
-		.unmap	      = hv_iommu_unmap,
+		.map_pages    = hv_iommu_map_pages,
+		.unmap_pages  = hv_iommu_unmap_pages,
 		.iova_to_phys = hv_iommu_iova_to_phys,
 		.free	      = hv_iommu_domain_free,
 	},
-	.pgsize_bitmap	    = HV_IOMMU_PGSIZES,
 	.owner		    = THIS_MODULE,
 };
 
@@ -849,7 +844,7 @@ static void __init hv_initialize_special_domains(void)
 	hv_null_dom.domid_num = 0xFFFFFFFF;  /* Blocked domain */
 }
 
-int __init hv_iommu_init(void)
+static int __init hv_iommu_init(void)
 {
 	int ret;
 	struct iommu_device *iommup = &hv_virt_iommu;
