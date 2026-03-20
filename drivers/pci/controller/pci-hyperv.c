@@ -2226,7 +2226,8 @@ static int hv_unmap_interrupt(union hv_device_id hv_devid,
 #define HV_LOGDEV_DEF_CPU 0
 #define HV_LOGDEV_DEF_IRQ 32
 
-static int hv_map_spi_base = 137;
+int hv_map_msi_interrupt(struct irq_data *data,
+			 struct hv_interrupt_entry *out_entry);
 
 static int hv_map_interrupt_hcall(u64 ptid, union hv_device_id device_id,
 				  bool level, int cpu, int vector,
@@ -2321,9 +2322,8 @@ static int hv_map_interrupt(u64 ptid, union hv_device_id device_id, bool level,
 		status = hv_map_interrupt_hcall(ptid, device_id, level, cpu,
 						vector, ret_entry);
 
-		if (hv_result_oom(status)) {
-			status = hv_call_deposit_memory(NUMA_NO_NODE,
-							ptid, status);
+		if (hv_result(status) == HV_STATUS_INSUFFICIENT_MEMORY) {
+			status = hv_call_deposit_pages(NUMA_NO_NODE, ptid, 1);
 			if (!hv_result_success(status)) {
 				pr_err("%s deposit pages failed:%llx\n",
 				       __func__, status);

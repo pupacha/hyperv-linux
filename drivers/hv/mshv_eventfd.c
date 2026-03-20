@@ -660,7 +660,7 @@ static int mshv_irq_bypass_add_producer(struct irq_bypass_consumer *cons,
 				      struct irq_bypass_producer *prod)
 {
 	struct mshv_irqfd *irqfd;
-
+	pr_err("mshv_irq_bypass_add_producer: Adding producer for eventfd %lu\n", prod->eventfd);
 	irqfd = container_of(cons, struct mshv_irqfd, irqfd_bypass_cons);
 	irqfd->irqfd_bypass_prod = prod;
 	irqfd->irqfd_passthru_dev = true;
@@ -671,7 +671,7 @@ static int mshv_irq_bypass_add_producer(struct irq_bypass_consumer *cons,
 	return 0;
 }
 
-void mshv_irq_bypass_del_producer(struct irq_bypass_consumer *cons,
+static void mshv_irq_bypass_del_producer(struct irq_bypass_consumer *cons,
 				  struct irq_bypass_producer *prod)
 {
 	struct mshv_irqfd *irqfd;
@@ -688,13 +688,13 @@ static void mshv_setup_irq_bypass(struct mshv_irqfd *irqfd)
 	struct irq_bypass_consumer *consumer = &irqfd->irqfd_bypass_cons;
 	int ret;
 
-	consumer->token = (void *)irqfd->irqfd_eventfd_ctx;
+	// consumer->eventfd = irqfd->irqfd_eventfd_ctx;
 	consumer->add_producer = mshv_irq_bypass_add_producer;
 	consumer->del_producer = mshv_irq_bypass_del_producer;
-	ret = irq_bypass_register_consumer(&irqfd->irqfd_bypass_cons);
+	ret = irq_bypass_register_consumer(&irqfd->irqfd_bypass_cons, irqfd->irqfd_eventfd_ctx);
 	if (ret)
 		pr_err("irq bypass consumer (%p) registration failed: %d\n",
-		       consumer->token, ret);
+		       irqfd->irqfd_eventfd_ctx, ret);
 }
 
 // #else

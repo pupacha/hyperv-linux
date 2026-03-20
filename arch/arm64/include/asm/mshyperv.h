@@ -19,7 +19,9 @@
 
 #include <linux/types.h>
 #include <linux/arm-smccc.h>
+#include <linux/errno.h>
 #include <hyperv/hvhdk.h>
+#include <linux/msi.h>
 
 /*
  * Declare calls to get and set Hyper-V VP register values on ARM64, which
@@ -66,6 +68,8 @@ void hv_irq_compose_msi_msg(struct irq_data *data,
 int hv_unmap_msi_interrupt(struct pci_dev *pdev,
 					struct hv_interrupt_entry *hvirqe);
 bool hv_pcidev_is_attached_dev(struct pci_dev *pdev);
+
+extern bool hv_no_attdev;
 
 /* SMCCC hypercall parameters */
 #define HV_SMCCC_FUNC_NUMBER	1
