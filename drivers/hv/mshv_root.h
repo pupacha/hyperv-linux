@@ -16,6 +16,7 @@
 #include <linux/dev_printk.h>
 #include <linux/build_bug.h>
 #include <linux/mmu_notifier.h>
+#include <asm/mshyperv.h>
 #include <uapi/linux/mshv.h>
 #include "mshv_trace.h"
 

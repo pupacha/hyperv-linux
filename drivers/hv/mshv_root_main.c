@@ -662,7 +662,7 @@ static int mshv_chk_get_mmio_start_pfn(struct mshv_partition *pt, u64 gfn,
 
 	/* Get the region again under the lock */
 	mreg = mshv_partition_region_by_gfn(pt, gfn);
-	if (mreg == NULL || mreg->type != MSHV_REGION_TYPE_MMIO)
+	if (mreg == NULL || mreg->mreg_type != MSHV_REGION_TYPE_MMIO)
 		goto unlock_pt_out;
 
 	uaddr = mreg->start_uaddr +
@@ -793,7 +793,7 @@ static bool mshv_handle_unmapped_gpa(struct mshv_vp *vp)
 	/* Do a fast check and bail if non mmio intercept */
 	gfn = msg->guest_physical_address >> HV_HYP_PAGE_SHIFT;
 	mreg = mshv_partition_region_by_gfn(pt, gfn);
-	if (mreg == NULL || mreg->type != MSHV_REGION_TYPE_MMIO)
+	if (mreg == NULL || mreg->mreg_type != MSHV_REGION_TYPE_MMIO)
 		return false;
 
 	rc = mshv_chk_get_mmio_start_pfn(pt, gfn, &mmio_spa);
@@ -844,10 +844,7 @@ static bool mshv_handle_gpa_intercept(struct mshv_vp *vp)
 	bool ret;
 	u64 gfn;
 
-	msg = (struct hv_x64_memory_intercept_message *)
-		vp->vp_intercept_msg_page->u.payload;
-
-	gfn = HVPFN_DOWN(msg->guest_physical_address);
+	gfn = mshv_get_gpa_intercept_gfn(vp);
 
 	region = mshv_partition_region_by_gfn_get(p, gfn);
 	if (!region)
@@ -863,11 +860,6 @@ static bool mshv_handle_gpa_intercept(struct mshv_vp *vp)
 
 	return ret;
 }
-
-#else  /* CONFIG_X86_64 */
-static bool mshv_handle_unmapped_gpa(struct mshv_vp *vp) { return false; }
-static bool mshv_handle_gpa_intercept(struct mshv_vp *vp) { return false; }
-#endif /* CONFIG_X86_64 */
 
 static bool mshv_vp_handle_intercept(struct mshv_vp *vp)
 {

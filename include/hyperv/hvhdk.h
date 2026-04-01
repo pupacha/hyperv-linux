@@ -14,7 +14,6 @@
  * Hypervisor statistics page format
  */
 struct hv_stats_page {
-	u64 vp_cntrs[VpStatsMaxCounter];		/* VP counters */
 	u64 data[HV_HYP_PAGE_SIZE / sizeof(u64)];
 } __packed;
 
