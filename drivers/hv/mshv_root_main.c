@@ -45,15 +45,13 @@ MODULE_DESCRIPTION("Microsoft Hyper-V root partition VMM interface /dev/mshv");
 #elif defined(CONFIG_ARM64)
 #define HV_VP_COUNTER_ROOT_DISPATCH_THREAD_BLOCKED 95
 #endif
-	VpStatsMaxCounter
-};
 
-struct hv_stats_page {
-	union {
-		u64 vp_cntrs[VpStatsMaxCounter];		/* VP counters */
-		u8 data[HV_HYP_PAGE_SIZE];
-	};
-} __packed;
+// struct hv_stats_page {
+// 	union {
+// 		u64 vp_cntrs[VpStatsMaxCounter];		/* VP counters */
+// 		u8 data[HV_HYP_PAGE_SIZE];
+// 	};
+// } __packed;
 
 bool hv_nofull_mmio;   /* don't map entire mmio region upon fault */
 static int __init setup_hv_full_mmio(char *str)

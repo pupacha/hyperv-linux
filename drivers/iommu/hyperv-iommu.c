@@ -769,7 +769,7 @@ static void hv_iommu_probe_finalize(struct device *dev)
 	struct iommu_domain *immdom = iommu_get_domain_for_dev(dev);
 
 	if (immdom && immdom->type == IOMMU_DOMAIN_DMA)
-		iommu_setup_dma_ops(dev);
+		iommu_setup_dma_ops(dev, immdom);
 	else
 		set_dma_ops(dev, NULL);
 }
